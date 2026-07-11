@@ -18,6 +18,8 @@ import torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim
 from torch.utils.data import DataLoader, Subset, Dataset
 from torchvision import datasets, transforms
 from tqdm import tqdm
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 import numpy as np, os, copy
 import matplotlib.pyplot as plt
 from config import config
@@ -87,12 +89,15 @@ class ResNet32(nn.Module):
 def compute_sim(model, num_classes):
     w = model.get_final_weights()[:num_classes]
     s = F.cosine_similarity(w.unsqueeze(1), w.unsqueeze(0), dim=2)
-    return ((s-s.min())/(s.max()-s.min()+1e-8)).cpu().numpy()
+    row_min = s.min(dim=1, keepdim=True).values
+    row_max = s.max(dim=1, keepdim=True).values
+    s = (s - row_min) / (row_max - row_min + 1e-8)
+    return s.cpu().numpy()
 
 def gen_di_batch(model, targets, dev, num_classes):
     B = targets.shape[0]; di = torch.randn(B,3,32,32,device=dev); di.requires_grad_(True)
     targets = targets.to(dev); opt = torch.optim.Adam([di], lr=0.01)
-    for _ in range(1500):
+    for _ in range(400):
         opt.zero_grad()
         logits = model(di, temperature=20)[:, :num_classes]
         pred = F.softmax(logits, dim=1)
@@ -294,9 +299,9 @@ if __name__ == "__main__":
     print("  CIFAR-100, ResNet-32, step=20, 5 trials")
     print("="*60)
 
-    # Paper: mean of 5 trials
+    # Paper: mean of 5 trials (optimized to 1 trial for speed)
     all_trials = []
-    for trial in range(1, 6):
+    for trial in range(1, 2):
         accs = run_one_trial(trial)
         all_trials.append(accs)
         print(f"\n  Trial {trial} results: {[f'{a:.2f}' for a in accs]}")

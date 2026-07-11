@@ -53,7 +53,10 @@ class UAPGen(nn.Module):
 def compute_sim(model):
     w = model.get_final_weights()
     s = F.cosine_similarity(w.unsqueeze(1), w.unsqueeze(0), dim=2)
-    return ((s - s.min()) / (s.max() - s.min() + 1e-8)).cpu().numpy()
+    row_min = s.min(dim=1, keepdim=True).values
+    row_max = s.max(dim=1, keepdim=True).values
+    s = (s - row_min) / (row_max - row_min + 1e-8)
+    return s.cpu().numpy()
 
 def gen_di_batch(model, targets, dev, ch=1):
     B = targets.shape[0]; di = torch.randn(B,ch,32,32,device=dev); di.requires_grad_(True)

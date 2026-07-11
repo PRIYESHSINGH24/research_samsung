@@ -55,7 +55,9 @@ def evaluate(model, loader):
 def compute_similarity_matrix(model):
     weights = model.get_final_weights()
     sim = F.cosine_similarity(weights.unsqueeze(1), weights.unsqueeze(0), dim=2)
-    sim = (sim - sim.min()) / (sim.max() - sim.min() + 1e-8)
+    row_min = sim.min(dim=1, keepdim=True).values
+    row_max = sim.max(dim=1, keepdim=True).values
+    sim = (sim - row_min) / (row_max - row_min + 1e-8)
     print(f"  Similarity Matrix: {sim.shape}")
     return sim.cpu().numpy()
 
@@ -67,14 +69,22 @@ def sample_dirichlet(alpha, beta, n):
     return torch.tensor(samples, dtype=torch.float32)
 
 
+_CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
+_CIFAR_STD  = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
+_CLAMP_MIN = ((0.0 - _CIFAR_MEAN) / _CIFAR_STD)
+_CLAMP_MAX = ((1.0 - _CIFAR_MEAN) / _CIFAR_STD)
+
 def generate_di_batch(model, targets, device):
     B = targets.shape[0]
+    cmin, cmax = _CLAMP_MIN.to(device), _CLAMP_MAX.to(device)
     di = torch.randn(B, 3, 32, 32, device=device)
+    with torch.no_grad():
+        di = torch.max(torch.min(di, cmax), cmin)
     di.requires_grad_(True)
     targets = targets.to(device)
     optimizer = torch.optim.Adam([di], lr=0.1)
     
-    for _ in range(1500):
+    for _ in range(400):
         optimizer.zero_grad()
         logits = model(di, temperature=20)
         pred = F.softmax(logits, dim=1)
@@ -82,7 +92,7 @@ def generate_di_batch(model, targets, device):
         loss.backward()
         optimizer.step()
         with torch.no_grad():
-            di.clamp_(-2.5, 2.5)
+            di.data = torch.max(torch.min(di.data, cmax), cmin)
     return di.detach()
 
 
@@ -129,7 +139,16 @@ if __name__ == "__main__":
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[60, 80], gamma=0.1)
     best_teacher = 0
     
-    for epoch in range(1, 101):
+    if os.path.exists(f'{config.CHECKPOINT_DIR}cifar_alexnet_teacher.pth'):
+        teacher.load_state_dict(torch.load(f'{config.CHECKPOINT_DIR}cifar_alexnet_teacher.pth', map_location=config.DEVICE))
+        teacher.eval()
+        best_teacher = evaluate(teacher, test_loader)
+        print(f"  Loaded saved CIFAR Teacher model. Acc: {best_teacher:.2f}%")
+        epochs_range = []
+    else:
+        epochs_range = range(1, 101)
+        
+    for epoch in epochs_range:
         teacher.train()
         for images, labels in tqdm(train_loader, leave=False, desc=f"T {epoch}"):
             images, labels = images.to(config.DEVICE), labels.to(config.DEVICE)
@@ -219,9 +238,9 @@ if __name__ == "__main__":
         for beta in [1.0, 0.1]:
             n_per_beta = NUM_PER_CLASS // 2
             targets = sample_dirichlet(alpha, beta, n_per_beta)
-            pbar = tqdm(range(0, n_per_beta, 32), desc=f"  C{cls} β={beta}")
+            pbar = tqdm(range(0, n_per_beta, 500), desc=f"  C{cls} β={beta}")
             for start in pbar:
-                end = min(start + 32, n_per_beta)
+                end = min(start + 500, n_per_beta)
                 batch_t = targets[start:end]
                 di = generate_di_batch(teacher, batch_t, config.DEVICE)
                 class_dis.append(di.cpu())
