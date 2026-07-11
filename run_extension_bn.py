@@ -157,23 +157,23 @@ def run_bn_extension_experiments():
     
     # Generate DIs without BN (standard)
     print("  Generating CIFAR-10 DIs without BN regularization...")
-    dis_no_bn, labels_no_bn = generate_full_di(teacher, 2000, [], use_bn=False)
+    dis_no_bn, labels_no_bn = generate_full_di(teacher, 4000, [], use_bn=False)
     
     # Generate DIs with BN
     print("  Generating CIFAR-10 DIs WITH BN regularization...")
-    dis_bn, labels_bn = generate_full_di(teacher, 2000, bn_layers, use_bn=True, lambda_bn=10.0)
+    dis_bn, labels_bn = generate_full_di(teacher, 4000, bn_layers, use_bn=True, lambda_bn=10.0)
     
     # Save a visualization of the generated DIs
     plt.figure(figsize=(10, 5))
     # Denormalize for plotting (mean=0.5, std=0.5 was used, so x_plot = x * 0.5 + 0.5)
     for i in range(5):
-        img_no_bn = (dis_no_bn[i*2000].permute(1, 2, 0).numpy() * 0.5 + 0.5).clip(0, 1)
+        img_no_bn = (dis_no_bn[i*4000].permute(1, 2, 0).numpy() * 0.5 + 0.5).clip(0, 1)
         plt.subplot(2, 5, i+1)
         plt.imshow(img_no_bn)
         plt.axis('off')
         if i == 2: plt.title("Standard DIs (No BN)")
         
-        img_bn = (dis_bn[i*2000].permute(1, 2, 0).numpy() * 0.5 + 0.5).clip(0, 1)
+        img_bn = (dis_bn[i*4000].permute(1, 2, 0).numpy() * 0.5 + 0.5).clip(0, 1)
         plt.subplot(2, 5, i+6)
         plt.imshow(img_bn)
         plt.axis('off')
