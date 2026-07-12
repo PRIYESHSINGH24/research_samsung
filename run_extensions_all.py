@@ -32,19 +32,13 @@ def sample_lognormal(alpha, beta, n):
     EXTENSION 3: Dirichlet Replacement (Log-Normal target sampler)
     Instead of Dirichlet, model target logits as Log-Normal distributed.
     """
-    # Convert alpha (similarities) to logit space base means
     alpha_clipped = np.clip(alpha, 1e-6, 1 - 1e-6)
     base_mu = np.log(alpha_clipped / (1.0 - alpha_clipped))
-    
-    # Scale base_mu and use beta to control variance in log-normal/logit space
-    # High concentration (beta=1.0) -> lower variance. Low concentration (beta=0.1) -> higher variance.
     variance = 1.0 / (beta + 1e-4)
     
     targets_list = []
     for _ in range(n):
-        # Sample logits from Gaussian
         logits = np.random.normal(loc=base_mu, scale=np.sqrt(variance))
-        # Apply Softmax to get target probability vector
         prob = np.exp(logits) / np.sum(np.exp(logits))
         targets_list.append(prob)
         
@@ -62,7 +56,6 @@ class AlexNetMultiLayer(nn.Module):
         self.features = {}
 
     def forward(self, x, temperature=1.0):
-        # Extract features at each pool/activation layer
         feat = x
         pool_count = 0
         self.features.clear()
@@ -75,7 +68,6 @@ class AlexNetMultiLayer(nn.Module):
 
         feat = feat.view(feat.size(0), -1)
 
-        # Through classifier
         for i, layer in enumerate(self.model.classifier):
             feat = layer(feat)
             if isinstance(layer, nn.ReLU) and i > 0:
@@ -142,7 +134,6 @@ def compute_multilayer_similarity(teacher, stage1_loader):
         sim = (sim - sim.min()) / (sim.max() - sim.min() + 1e-8)
         layer_sims[layer_name] = sim.numpy()
         
-    # Increasing weights (deeper layers get more weight)
     names = list(layer_sims.keys())
     weights = {name: (i+1)/sum(range(1, len(names)+1)) for i, name in enumerate(names)}
     
@@ -193,7 +184,11 @@ def generate_di_batch(model, targets, dev, ext_prior=False, lambda_tv=1e-4, lamb
 
 def generate_full_di(model, num_per_class, sim_matrix, ext_sampler=False, ext_prior=False):
     """Generate all DIs for ZSKD"""
+    # Temporarily move to CPU for stable and fast DI generation
+    orig_device = next(model.parameters()).device
+    model.to('cpu')
     model.eval()
+    
     num_classes = sim_matrix.shape[0]
     all_dis, all_labels = [], []
     
@@ -203,7 +198,6 @@ def generate_full_di(model, num_per_class, sim_matrix, ext_sampler=False, ext_pr
         for beta in [1.0, 0.1]:
             n_per_beta = num_per_class // 2
             
-            # EXTENSION 3: Dirichlet Replacement
             if ext_sampler:
                 targets = sample_lognormal(alpha, beta, n_per_beta)
             else:
@@ -212,13 +206,15 @@ def generate_full_di(model, num_per_class, sim_matrix, ext_sampler=False, ext_pr
             for start in range(0, n_per_beta, 500):
                 end = min(start + 500, n_per_beta)
                 batch_t = targets[start:end]
-                di = generate_di_batch(model, batch_t, config.DEVICE, ext_prior=ext_prior)
+                di = generate_di_batch(model, batch_t, torch.device('cpu'), ext_prior=ext_prior)
                 class_dis.append(di.cpu())
                 
         ct = torch.cat(class_dis, dim=0)
         all_dis.append(ct)
         all_labels.extend([cls] * num_per_class)
+        print(f"    Class {cls+1}/{num_classes} DIs generated.")
         
+    model.to(orig_device)
     return torch.cat(all_dis, dim=0), torch.tensor(all_labels, dtype=torch.long)
 
 # ═══════════════════════════════════
@@ -247,10 +243,6 @@ class AugDIDataset(Dataset):
         return img_aug, label
 
 def train_student(teacher, student, di_loader, test_loader, ext_dynamic=False, epochs=500):
-    """
-    Train student model.
-    EXTENSION 5: Dynamic class similarity matching via target mixup based on student boundaries.
-    """
     optimizer = optim.Adam(student.parameters(), lr=0.001)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     best_acc = 0
@@ -263,16 +255,12 @@ def train_student(teacher, student, di_loader, test_loader, ext_dynamic=False, e
                 t_logits = teacher(batch)
             s_logits = student(batch)
             
-            # Target softening
             soft_t = F.softmax(t_logits / 20, dim=1)
             
-            # EXTENSION 5: Dynamic Similarity Mixing
             if ext_dynamic:
-                # Calculate active prediction overlaps on student output
                 with torch.no_grad():
                     soft_s = F.softmax(s_logits / 20, dim=1)
-                # Mix target distributions to regularize drifting boundaries
-                mix_coeff = 0.15 * (epoch / epochs)  # linearly increase regularization coeff
+                mix_coeff = 0.15 * (epoch / epochs)
                 soft_t = (1.0 - mix_coeff) * soft_t + mix_coeff * soft_s
                 
             log_s = F.log_softmax(s_logits / 20, dim=1)
@@ -283,7 +271,6 @@ def train_student(teacher, student, di_loader, test_loader, ext_dynamic=False, e
             optimizer.step()
         scheduler.step()
         
-        # Eval epoch
         if epoch % 50 == 0 or epoch == epochs:
             student.eval()
             correct = total = 0
@@ -317,7 +304,6 @@ def main():
     print(f"  Total DIs: {args.num_di} | Epochs: {args.epochs}")
     print("="*70)
     
-    # Load CIFAR-10 datasets with correct normalization
     tf_test = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465),
@@ -325,30 +311,24 @@ def main():
     ])
     test_loader = DataLoader(datasets.CIFAR10('data/', train=False, transform=tf_test), batch_size=256, shuffle=False)
     
-    # Load Teacher model
     teacher = AlexNet().to(config.DEVICE)
     teacher.load_state_dict(torch.load(f'{config.CHECKPOINT_DIR}cifar_alexnet_teacher.pth', map_location=config.DEVICE))
     teacher.eval()
     
-    # ── BASELINE RUN: Standard ZSKD ──
     print("\n>>> Stage 0: Evaluating Baseline ZSKD...")
     base_sim = compute_similarity(teacher)
     
-    # ── GENERATION & EVALUATION ──
     if args.extension == 2:
         print("\n>>> Running Extension 2: Multilayer Similarity Matrix...")
-        # 1-Stage DIs to compute similarity
         print("  Generating Stage-1 standard DIs as proxy data...")
         s1_dis, s1_labels = generate_full_di(teacher, 2000, base_sim)
         s1_loader = DataLoader(AugDIDataset(s1_dis, s1_labels), batch_size=128, shuffle=False)
-        # Compute Multilayer matrix
         multi_sim = compute_multilayer_similarity(teacher, s1_loader)
-        # Generate Final DIs using Multilayer Sim
         print("  Generating final DIs using Multilayer Similarity...")
         dis_ext, labels_ext = generate_full_di(teacher, args.num_di // 10, multi_sim)
         
     elif args.extension == 3:
-        print("\n>>> Running Extension 3: Log-Normal Target Sampling (Dirichlet Replacement)...")
+        print("\n>>> Running Extension 3: Log-Normal Target Sampling...")
         dis_ext, labels_ext = generate_full_di(teacher, args.num_di // 10, base_sim, ext_sampler=True)
         
     elif args.extension == 4:
@@ -357,27 +337,22 @@ def main():
         
     elif args.extension == 5:
         print("\n>>> Running Extension 5: Dynamic Class Similarity Matrix...")
-        # Uses standard DIs, but dynamic updates occur during student training
         dis_ext, labels_ext = generate_full_di(teacher, args.num_di // 10, base_sim)
         
-    # Generate standard baseline DIs for parallel comparison if needed
     print("\n>>> Generating standard baseline DIs for comparison...")
     dis_base, labels_base = generate_full_di(teacher, args.num_di // 10, base_sim)
     
-    # Train standard baseline student
     print("\n>>> Training student on standard DIs...")
     student_base = AlexNetHalf().to(config.DEVICE)
     dl_base = DataLoader(AugDIDataset(dis_base, labels_base), batch_size=128, shuffle=True)
     acc_base = train_student(teacher, student_base, dl_base, test_loader, epochs=args.epochs)
     
-    # Train extension student
     print(f"\n>>> Training student on Extension {args.extension} DIs...")
     student_ext = AlexNetHalf().to(config.DEVICE)
     dl_ext = DataLoader(AugDIDataset(dis_ext, labels_ext), batch_size=128, shuffle=True)
     acc_ext = train_student(teacher, student_ext, dl_ext, test_loader, 
                             ext_dynamic=(args.extension == 5), epochs=args.epochs)
     
-    # Output Scorecard
     print("\n" + "="*50)
     print(f"  ZSKD EXTENSION {args.extension} REPORT CARD")
     print("="*50)

@@ -15,7 +15,7 @@ from config import config
 _CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
 _CIFAR_STD  = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
 _CLAMP_MIN = ((0.0 - _CIFAR_MEAN) / _CIFAR_STD)
-_CLAMP_MAX = ((1.0 - _CIFAR_MEAN) / _CLAMP_STD)
+_CLAMP_MAX = ((1.0 - _CIFAR_MEAN) / _CIFAR_STD)
 
 # ═══════════════════════════════════
 # DI GENERATION WITH BATCHNORM HOOKS
@@ -88,7 +88,13 @@ def compute_similarity(model):
     return sim.cpu().numpy()
 
 def generate_full_di(model, num_per_class, bn_layers, use_bn=True, lambda_bn=10.0):
+    # Temporarily move model to CPU for stable and fast dynamic image generation
+    orig_device = next(model.parameters()).device
+    model.to('cpu')
     model.eval()
+    
+    bn_layers_cpu = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
+    
     sim = compute_similarity(model)
     num_classes = sim.shape[0]
     all_dis, all_labels = [], []
@@ -103,14 +109,16 @@ def generate_full_di(model, num_per_class, bn_layers, use_bn=True, lambda_bn=10.
                 end = min(start + 500, n_per_beta)
                 batch_t = targets[start:end]
                 if use_bn:
-                    di = generate_di_batch_bn(model, batch_t, config.DEVICE, bn_layers, lambda_bn, 400)
+                    di = generate_di_batch_bn(model, batch_t, torch.device('cpu'), bn_layers_cpu, lambda_bn, 400)
                 else:
-                    di = generate_di_batch_bn(model, batch_t, config.DEVICE, [], 0.0, 400)
+                    di = generate_di_batch_bn(model, batch_t, torch.device('cpu'), [], 0.0, 400)
                 class_dis.append(di.cpu())
         ct = torch.cat(class_dis, dim=0)
         all_dis.append(ct)
         all_labels.extend([cls] * num_per_class)
+        print(f"    Class {cls+1}/{num_classes} DIs generated.")
         
+    model.to(orig_device)
     return torch.cat(all_dis, dim=0), torch.tensor(all_labels, dtype=torch.long)
 
 class AugDIDataset(Dataset):
@@ -172,7 +180,7 @@ def train_student_eval(teacher, student, di_loader, test_loader, epochs=500):
 
 def run_bn_extension_experiments():
     print("="*60)
-    print("  EXTENSION 1: BATCH NORMALIZATION STATS MATCHING (CORRECTED)")
+    print("  EXTENSION 1: BATCH NORMALIZATION STATS MATCHING")
     print("="*60)
     
     # ── CIFAR-10 (AlexNet) ──
