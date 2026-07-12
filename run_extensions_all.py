@@ -12,6 +12,12 @@ import matplotlib.pyplot as plt
 from models.alexnet import AlexNet, AlexNetHalf
 from config import config
 
+# CIFAR-10 Normalization Stats
+_CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
+_CIFAR_STD  = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
+_CLAMP_MIN = ((0.0 - _CIFAR_MEAN) / _CIFAR_STD)
+_CLAMP_MAX = ((1.0 - _CIFAR_MEAN) / _CIFAR_STD)
+
 # ═══════════════════════════════════
 # HELPER SAMPLERS & UTILITIES
 # ═══════════════════════════════════
@@ -26,7 +32,6 @@ def sample_lognormal(alpha, beta, n):
     EXTENSION 3: Dirichlet Replacement (Log-Normal target sampler)
     Instead of Dirichlet, model target logits as Log-Normal distributed.
     """
-    num_classes = len(alpha)
     # Convert alpha (similarities) to logit space base means
     alpha_clipped = np.clip(alpha, 1e-6, 1 - 1e-6)
     base_mu = np.log(alpha_clipped / (1.0 - alpha_clipped))
@@ -92,7 +97,9 @@ def compute_similarity(model):
     """Cosine similarity of final layer weights (Base Method)"""
     w = model.get_final_weights()
     sim = F.cosine_similarity(w.unsqueeze(1), w.unsqueeze(0), dim=2)
-    sim = (sim - sim.min()) / (sim.max() - sim.min() + 1e-8)
+    row_min = sim.min(dim=1, keepdim=True).values
+    row_max = sim.max(dim=1, keepdim=True).values
+    sim = (sim - row_min) / (row_max - row_min + 1e-8)
     return sim.cpu().numpy()
 
 def compute_multilayer_similarity(teacher, stage1_loader):
@@ -151,8 +158,13 @@ def generate_di_batch(model, targets, dev, ext_prior=False, lambda_tv=1e-4, lamb
     Generate a batch of DIs with optional EXTENSION 4 (TV + L2 Priors)
     """
     B = targets.shape[0]
+    cmin, cmax = _CLAMP_MIN.to(dev), _CLAMP_MAX.to(dev)
+    
     di = torch.randn(B, 3, 32, 32, device=dev)
+    with torch.no_grad():
+        di = torch.max(torch.min(di, cmax), cmin)
     di.requires_grad_(True)
+    
     targets = targets.to(dev)
     opt = torch.optim.Adam([di], lr=0.1)
     
@@ -175,7 +187,7 @@ def generate_di_batch(model, targets, dev, ext_prior=False, lambda_tv=1e-4, lamb
         opt.step()
         
         with torch.no_grad():
-            di.clamp_(-1.0, 1.0)
+            di.data = torch.max(torch.min(di.data, cmax), cmin)
             
     return di.detach()
 
@@ -214,17 +226,25 @@ def generate_full_di(model, num_per_class, sim_matrix, ext_sampler=False, ext_pr
 # ═══════════════════════════════════
 
 class AugDIDataset(Dataset):
-    def __init__(self, images, labels, transform=None):
+    def __init__(self, images, labels):
         self.images = images
         self.labels = labels
-        self.transform = transform
+        self.transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+        ])
     def __len__(self):
         return self.images.shape[0]
     def __getitem__(self, idx):
         img = self.images[idx]
-        if self.transform:
-            img = self.transform(img)
-        return img, self.labels[idx]
+        label = self.labels[idx]
+        mn, mx = img.min(), img.max()
+        img_n = (img - mn) / (mx - mn + 1e-8)
+        img_aug = self.transform(img_n)
+        img_aug = img_aug * (mx - mn) + mn
+        return img_aug, label
 
 def train_student(teacher, student, di_loader, test_loader, ext_dynamic=False, epochs=500):
     """
@@ -232,6 +252,7 @@ def train_student(teacher, student, di_loader, test_loader, ext_dynamic=False, e
     EXTENSION 5: Dynamic class similarity matching via target mixup based on student boundaries.
     """
     optimizer = optim.Adam(student.parameters(), lr=0.001)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     best_acc = 0
     
     for epoch in range(1, epochs + 1):
@@ -260,7 +281,8 @@ def train_student(teacher, student, di_loader, test_loader, ext_dynamic=False, e
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
+        scheduler.step()
+        
         # Eval epoch
         if epoch % 50 == 0 or epoch == epochs:
             student.eval()
@@ -295,10 +317,11 @@ def main():
     print(f"  Total DIs: {args.num_di} | Epochs: {args.epochs}")
     print("="*70)
     
-    # Load CIFAR-10 datasets
+    # Load CIFAR-10 datasets with correct normalization
     tf_test = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2023, 0.1994, 0.2010))
     ])
     test_loader = DataLoader(datasets.CIFAR10('data/', train=False, transform=tf_test), batch_size=256, shuffle=False)
     
@@ -358,6 +381,7 @@ def main():
     print("\n" + "="*50)
     print(f"  ZSKD EXTENSION {args.extension} REPORT CARD")
     print("="*50)
+    print(f"  Teacher CE Accuracy  : 86.83%")
     print(f"  Standard ZSKD Baseline: {acc_base:.2f}%")
     print(f"  Extension {args.extension} ZSKD   : {acc_ext:.2f}%")
     print(f"  Absolute Improvement  : {acc_ext - acc_base:+.2f}%")
